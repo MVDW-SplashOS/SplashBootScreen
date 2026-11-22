@@ -1,0 +1,14 @@
+# Give the text console (fbcon + cursor) back once GDM owns the display.
+# Rebinding fbcon while the VT is still in text mode repaints it black, so
+# wait until the graphical session has switched the VT to graphics mode.
+# Type=simple: the delay must not hold up the end of the boot transaction.
+[Unit]
+Description=Restore the text console after the SplashOS boot screen
+After=gdm.service splash-boot-screen.service
+ConditionKernelCommandLine=quiet
+
+[Service]
+ExecStart=/bin/sh -c 'sleep 10; exec /usr/bin/splash-boot-screen --restore-console'
+
+[Install]
+WantedBy=graphical.target

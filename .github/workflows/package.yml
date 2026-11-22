@@ -1,0 +1,181 @@
+# Packages splash_boot_screen for the SplashBuilder desktop edition:
+#
+#   1. verification build (libsystemd from the runner)
+#   2. assembles the SOURCE package tarball (<pkg>-<ver>/ top-level dir with
+#      the sources + the BuildScripts manifest/build script)
+#   3. publishes it as a pre-release asset, so SourceStream can fetch it via
+#      the upstream-sources.yml release URL and repack it like any other
+#      package
+#
+# Run manually, or push to main / a v* tag. The version comes from VERSION;
+# bump it (and the edition pin in desktop-base.yml) for a new release.
+name: package splash_boot_screen
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout the boot screen sources
+        uses: actions/checkout@v4
+
+      - name: Checkout BuildScripts (manifest + build script)
+        uses: actions/checkout@v4
+        with:
+          repository: MVDW-SplashOS/BuildScripts
+          ref: main
+          path: buildscripts
+          persist-credentials: false
+
+      - name: Read the package version
+        id: version
+        run: |
+          ver="$(tr -d ' \n' < VERSION)"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "package version: $ver"
+
+      - name: Install libsystemd (verification build)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsystemd-dev
+
+      - name: Verification build
+        run: make
+
+      - name: Assemble the source package tarball
+        id: package
+        run: |
+          ver="${{ steps.version.outputs.version }}"
+          pkg="splash_boot_screen-$ver"
+          # SourceStream's repacker requires exactly ONE top-level dir in the
+          # archive; manifest.yml + build/ go INSIDE it.
+          mkdir -p "stage/$pkg/build"
+          cp -r splash-boot-screen.c Makefile README.md VERSION assets systemd dracut "stage/$pkg/"
+          cp "buildscripts/splash_boot_screen/$ver/manifest.yml" "stage/$pkg/"
+          cp "buildscripts/splash_boot_screen/$ver/build/"*.sh "stage/$pkg/build/"
+          tar --owner=0 --group=0 --numeric-owner \
+              -cJf "$pkg.tar.xz" -C stage "$pkg"
+          echo "tarball=$pkg.tar.xz" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ steps.version.outputs.version }}"
+          name: "splash_boot_screen ${{ steps.version.outputs.version }}"
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: ${{ steps.package.outputs.tarball }}
+
+      # ---- auto deploy: repack + push to syspkg (same as BuildScripts) ----
+      # SourceStream fetches the release asset through the upstream-sources.yml
+      # entry, repacks it with the BuildScripts manifest/build script and
+      # SFTPs it to source-packages/ on the syspkg origin. desktop-base.yml
+      # MUST list splash_boot_screen at the same version as VERSION.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # SourceStream uses Python 3.12+ f-string syntax (see the note in
+          # the BuildScripts deploy workflow); 3.11 fails at import.
+          python-version: "3.13"
+
+      - name: Get SourceStream
+        run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/MVDW-SplashOS/SourceStream.git
+
+      - name: Install SourceStream dependencies
+        # --require-hashes enforces the hash-pinned lock file (same as the
+        # BuildScripts deploy workflow).
+        run: pip install --require-hashes '--only-binary=:all:' -r SourceStream/requirements-lock.txt
+
+      - name: Point SourceStream at the desktop-base edition
+        working-directory: SourceStream
+        run: |
+          # The package must be listed in the edition SourceStream fetches
+          # (packageQueue looks the version up there); desktop-base carries
+          # splash_boot_screen.
+          sed -i 's/^edition: "molecule"/edition: "desktop-base"/' config.yml
+          grep '^edition:' config.yml
+
+      - name: Write SFTP private key
+        env:
+          SFTP_KEY: ${{ secrets.SPLASHOS_SFTP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$SFTP_KEY" ]; then
+            echo "::error::Secret SPLASHOS_SFTP_PRIVATE_KEY is not set."
+            echo "::error::Add the same two secrets the BuildScripts deploy"
+            echo "::error::uses (SPLASHOS_SFTP_USER, SPLASHOS_SFTP_PRIVATE_KEY)"
+            echo "::error::to this repository."
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SFTP_KEY" > ~/.ssh/splashos_sftp_key
+          chmod 600 ~/.ssh/splashos_sftp_key
+          if ! ssh-keygen -y -f ~/.ssh/splashos_sftp_key > /dev/null; then
+            echo "::error::SPLASHOS_SFTP_PRIVATE_KEY is not a valid OpenSSH private key."
+            exit 1
+          fi
+
+      - name: Configure SourceStream push target
+        working-directory: SourceStream
+        env:
+          SFTP_HOST: iloot.it
+          SFTP_PORT: 221
+          SFTP_USER: ${{ secrets.SPLASHOS_SFTP_USER }}
+          SFTP_KEYFILE: /home/runner/.ssh/splashos_sftp_key
+          # splashos_git is chrooted to /var/www on the server, so /var/www/
+          # is seen as / from the SFTP session.
+          SFTP_PATH: /splashos_syspkg/source-packages
+        run: |
+          python - <<'EOF'
+          import os, yaml
+          with open("config.yml") as f:
+              config = yaml.safe_load(f)
+          config["push"] = {
+              "type": "sftp",
+              "sftp": {
+                  "host": os.environ["SFTP_HOST"],
+                  "port": int(os.environ["SFTP_PORT"]),
+                  "username": os.environ["SFTP_USER"],
+                  "keyfile": os.environ["SFTP_KEYFILE"],
+                  "path": os.environ["SFTP_PATH"],
+              },
+          }
+          with open("config.yml", "w") as f:
+              yaml.safe_dump(config, f, default_flow_style=False)
+          print("push target:", config["push"]["type"],
+                config["push"]["sftp"]["host"] + ":" + str(config["push"]["sftp"]["port"]),
+                config["push"]["sftp"]["path"], "(key auth)")
+          EOF
+
+      - name: Pin SFTP host key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          # paramiko's default policy rejects unknown hosts; SourceStream's
+          # push.py loads the system known_hosts, so the pin must exist.
+          if ! ssh-keyscan -T 15 -p 221 iloot.it >> ~/.ssh/known_hosts; then
+            echo "::error::ssh-keyscan could not reach iloot.it:221 from this runner."
+            echo "::error::It works from other networks? Then the server firewall is likely"
+            echo "::error::blocking GitHub Actions IPs. Allowlist them (dynamic ranges from"
+            echo "::error::https://api.github.com/meta -> \"actions\") or open port 221 to all."
+            exit 1
+          fi
+
+      - name: Repack and push to syspkg
+        working-directory: SourceStream
+        run: |
+          # Fetches the just-published pre-release asset via its
+          # upstream-sources.yml entry, repacks it with the BuildScripts
+          # manifest/build script and SFTPs it to
+          # source-packages/splash_boot_screen/ on the syspkg origin.
+          python run.py "p:splash_boot_screen"

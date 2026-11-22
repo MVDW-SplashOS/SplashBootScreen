@@ -1,0 +1,20 @@
+# SplashOS boot screen: static boot-manager logo + progress bar.
+# Runs twice per boot: in the initrd (dracut module 90splash-boot-screen)
+# and again right after switch-root; both share the progress in /run.
+# Only on "quiet" boots - the debug entry keeps the text console.
+[Unit]
+Description=SplashOS boot screen
+DefaultDependencies=no
+ConditionKernelCommandLine=quiet
+ConditionKernelCommandLine=!nosplash
+# Get out of the way of anything that needs the text console, and stop
+# before switch-root (the initrd copy) or shutdown.
+Conflicts=emergency.service rescue.service initrd-switch-root.target shutdown.target
+Before=emergency.service rescue.service initrd-switch-root.target shutdown.target
+
+[Service]
+ExecStart=/usr/bin/splash-boot-screen
+TimeoutStopSec=2
+
+[Install]
+WantedBy=sysinit.target
