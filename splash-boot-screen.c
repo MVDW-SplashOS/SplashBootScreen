@@ -21,6 +21,8 @@
  * before the D-Bus broker starts. The initrd fills 0-30% of the bar and
  * the real root 30-100%; the value reached is kept in /run (which survives
  * switch-root) so the bar never moves backwards between the two instances.
+ * The bar fades in once when it first appears (the fade state is shared
+ * through /run too) and glides towards each new value at a bounded speed.
  *
  * Every frame is composed in memory and copied to the framebuffer in one
  * pass, so repainting the logo over an identical logo causes no flicker.
@@ -63,6 +65,17 @@
 #define FRAME_NS	16000000L	/* ~60 fps */
 #define POLL_FRAMES	3		/* ask systemd every 3rd frame */
 #define LINGER_SEC	120		/* give up this long after 100% */
+
+/* bar motion: the shown value chases systemd's progress at a speed
+ * proportional to the distance (GAIN per second), clamped to
+ * [MIN_SPEED, MAX_SPEED] of the full bar per second, so a big step in
+ * systemd's progress becomes a smooth glide instead of a jump */
+#define GAIN		2.5
+#define MIN_SPEED	0.03
+#define MAX_SPEED	0.35
+#define FADE_SEC	0.5	/* bar fade-in (once per boot, no fade-out) */
+#define FINISH_MIN	0.15	/* GDM handoff: ease the rest in .15-.45 s */
+#define FINISH_MAX	0.45
 
 /* bar colours on black (0..255) */
 #define OUTLINE_GREY	176
@@ -315,7 +328,7 @@ static float coverage(float sd)
 
 /* Paint the bar region (plus a 1px margin) at progress p into buf. */
 static void draw_bar(unsigned char *buf, size_t scanline,
-		     const struct bar *b, float p)
+		     const struct bar *b, float p, float alpha)
 {
 	float ox = (float)b->x, oy = (float)b->y;
 	float ow = (float)b->w, oh = (float)b->h;
@@ -342,7 +355,7 @@ static void draw_bar(unsigned char *buf, size_t scanline,
 			float fill = p > 0.0f
 				? coverage(sd_capsule(px, py, ix, iy, fw, ih)) * fade
 				: 0.0f;
-			float v = ring * OUTLINE_GREY + fill * FILL_WHITE;
+			float v = (ring * OUTLINE_GREY + fill * FILL_WHITE) * alpha;
 			unsigned char c = (unsigned char)clampf(v + 0.5f, 0, 255);
 			unsigned char *d = row + (size_t)x * 4;
 
@@ -388,26 +401,29 @@ static double systemd_progress(sd_bus **bus)
 	return v;
 }
 
-static double read_floor(void)
+/* State shared by the initrd and real-root instances: the progress shown
+ * and how far the bar has faded in (0 = not shown yet). */
+static void read_state(double *progress, double *alpha)
 {
 	FILE *f = fopen(PROGRESS_FILE, "re");
-	double v = 0;
+	double v = 0, a = 0;
 
 	if (f) {
-		if (fscanf(f, "%lf", &v) != 1)
+		if (fscanf(f, "%lf %lf", &v, &a) < 1)
 			v = 0;
 		fclose(f);
 	}
-	return clampf((float)v, 0, 1);
+	*progress = clampf((float)v, 0, 1);
+	*alpha = clampf((float)a, 0, 1);
 }
 
-static void write_floor(double v)
+static void write_state(double v, double alpha)
 {
 	FILE *f = fopen(PROGRESS_FILE ".tmp", "we");
 
 	if (!f)
 		return;
-	fprintf(f, "%.4f\n", v);
+	fprintf(f, "%.4f %.4f\n", v, alpha);
 	if (fclose(f) == 0)
 		rename(PROGRESS_FILE ".tmp", PROGRESS_FILE);
 }
@@ -425,6 +441,44 @@ static int open_fb(const char *path)
 		usleep(20000);
 	}
 	return -1;
+}
+
+static double now_sec(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static double smoothstep(double t)
+{
+	t = t < 0 ? 0 : (t > 1 ? 1 : t);
+	return t * t * (3 - 2 * t);
+}
+
+/* Move the shown value towards the target over dt seconds. */
+static double glide(double shown, double target, double dt)
+{
+	double gap = target - shown;
+	double speed = gap * GAIN;
+
+	if (gap <= 0)
+		return shown;
+	if (speed < MIN_SPEED)
+		speed = MIN_SPEED;
+	if (speed > MAX_SPEED)
+		speed = MAX_SPEED;
+	return speed * dt >= gap ? target : shown + speed * dt;
+}
+
+static void push_bar(unsigned char *fb, const unsigned char *back,
+		     size_t scanline, const struct bar *b)
+{
+	for (unsigned y = b->y - 1; y <= b->y + b->h; y++)
+		memcpy(fb + (size_t)y * scanline + (size_t)(b->x - 1) * 4,
+		       back + (size_t)y * scanline + (size_t)(b->x - 1) * 4,
+		       (size_t)(b->w + 2) * 4);
 }
 
 static void sleep_frame(void)
@@ -513,57 +567,66 @@ int main(int argc, char **argv)
 	if (fb == MAP_FAILED)
 		return 1;
 
-	double shown = read_floor();
+	double shown, alpha;
+	read_state(&shown, &alpha);
 	double target = shown;
 
 	/* test hook: paint one picture at a fixed progress and exit */
 	if (getenv("SPLASH_TEST_PROGRESS")) {
 		shown = atof(getenv("SPLASH_TEST_PROGRESS"));
+		alpha = getenv("SPLASH_TEST_ALPHA") ? atof(getenv("SPLASH_TEST_ALPHA")) : 1.0;
 		blit_frame(logo_frame(&lg, lg.nframes - 1), lg.w, back, scanline,
 			   xoff, yoff, xs, ys, tw, th);
 		if (have_bar)
-			draw_bar(back, scanline, &b, (float)shown);
+			draw_bar(back, scanline, &b, (float)shown, (float)alpha);
 		memcpy(fb, back, screen);
 		return 0;
 	}
 
 	/* compose the whole screen, then replace the framebuffer in one pass:
-	 * the logo pixels the boot manager left behind are rewritten with
-	 * identical values, so nothing visibly changes but the bar. */
+	 * the logo pixels the boot manager (or the kernel) left behind are
+	 * rewritten with identical values, so nothing visibly changes. The bar
+	 * starts at the fade level reached so far - invisible on a fresh boot. */
 	blit_frame(logo_frame(&lg, lg.nframes - 1), lg.w, back, scanline,
 		   xoff, yoff, xs, ys, tw, th);
 	if (have_bar)
-		draw_bar(back, scanline, &b, (float)shown);
+		draw_bar(back, scanline, &b, (float)shown, (float)alpha);
 	fbcon_bind(0);
 	memcpy(fb, back, screen);
 
 	sd_bus *bus = NULL;
 	unsigned frame = 0;
 	time_t full_since = 0;
+	double last = now_sec();
+	/* resume a fade the previous instance did not finish */
+	double fade_start = last - alpha * FADE_SEC;
 
 	while (!stop_requested) {
+		double t = now_sec(), dt = t - last;
+		last = t;
+		if (dt > 0.1)
+			dt = 0.1;	/* after a stall, do not leap */
+
 		if (frame++ % POLL_FRAMES == 0) {
 			double p = systemd_progress(&bus);
 			if (p >= 0) {
-				double t = base + span * p;
-				if (t > target)
-					target = t;
+				double v = base + span * p;
+				if (v > target)
+					target = v;
 			}
 		}
-		/* ease towards the target: quick to move, never backwards */
-		double next = shown + (target - shown) * 0.12;
-		if (target - next < 0.0005)
-			next = target;
-		if (have_bar && (unsigned)(next * b.w * 4) != (unsigned)(shown * b.w * 4)) {
-			draw_bar(back, scanline, &b, (float)next);
-			for (unsigned y = b.y - 1; y <= b.y + b.h; y++)
-				memcpy(fb + (size_t)y * scanline + (size_t)(b.x - 1) * 4,
-				       back + (size_t)y * scanline + (size_t)(b.x - 1) * 4,
-				       (size_t)(b.w + 2) * 4);
+
+		double next = glide(shown, target, dt);
+		double next_alpha = smoothstep((t - fade_start) / FADE_SEC);
+		if (have_bar && (next_alpha != alpha ||
+		    (unsigned)(next * b.w * 4) != (unsigned)(shown * b.w * 4))) {
+			draw_bar(back, scanline, &b, (float)next, (float)next_alpha);
+			push_bar(fb, back, scanline, &b);
 		}
-		if (next != shown)
-			write_floor(next);
+		if (next != shown || next_alpha != alpha)
+			write_state(next, next_alpha);
 		shown = next;
+		alpha = next_alpha;
 
 		if (!in_initrd && shown >= 1.0) {
 			if (!full_since)
@@ -574,21 +637,38 @@ int main(int argc, char **argv)
 		sleep_frame();
 	}
 
-	/* Stopped by GDM in the real root: finish the bar quickly (~0.2 s) so
-	 * the handoff shows a complete bar instead of a stalled one. */
-	if (!in_initrd && have_bar && shown < 1.0) {
-		for (int i = 1; i <= 12; i++) {
-			double v = shown + (1.0 - shown) * i / 12.0;
-			draw_bar(back, scanline, &b, (float)v);
-			for (unsigned y = b.y - 1; y <= b.y + b.h; y++)
-				memcpy(fb + (size_t)y * scanline + (size_t)(b.x - 1) * 4,
-				       back + (size_t)y * scanline + (size_t)(b.x - 1) * 4,
-				       (size_t)(b.w + 2) * 4);
+	/* Stopped by GDM in the real root: ease the rest of the bar in (and
+	 * finish a fade still in progress) so the handoff shows a complete
+	 * bar. In the initrd just exit: the real-root instance continues. */
+	if (!in_initrd && have_bar && (shown < 1.0 || alpha < 1.0)) {
+		double from = shown, t0 = now_sec();
+		double dur = (1.0 - from) / 0.6;
+		double fade_left = FADE_SEC - (t0 - fade_start);
+		if (dur < FINISH_MIN)
+			dur = FINISH_MIN;
+		if (dur > FINISH_MAX)
+			dur = FINISH_MAX;
+		if (fade_left > dur)
+			dur = fade_left;	/* never pop a half-faded bar in */
+		for (;;) {
+			double t = now_sec();
+			double k = (t - t0) / dur;
+			if (k > 1)
+				k = 1;
+			double e = 1 - (1 - k) * (1 - k) * (1 - k);	/* ease-out */
+			double a = smoothstep((t - fade_start) / FADE_SEC);
+			if (k >= 1)
+				a = 1;
+			draw_bar(back, scanline, &b, (float)(from + (1.0 - from) * e), (float)a);
+			push_bar(fb, back, scanline, &b);
+			if (k >= 1)
+				break;
 			sleep_frame();
 		}
 		shown = 1.0;
+		alpha = 1.0;
 	}
-	write_floor(shown);
+	write_state(shown, alpha);
 
 	/* The picture stays on the screen after exit; the console stays
 	 * unbound until splash-boot-screen-console.service gives it back. */
